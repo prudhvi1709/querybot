@@ -72,11 +72,13 @@ SYSTEM_PROMPT = (
     "3. Use straightforward GROUP BY and aggregations\n"
     "4. Never use LIMIT, Display all results\n"
     "5. Focus on finding meaningful patterns in the data\n\n"
-    "When working with dates:\n"
-    "1. ALWAYS use TRY_CAST() instead of CAST() for date conversions\n"
-    "2. If dates are in MM/DD/YYYY format, convert them using: TRY_CAST(regexp_replace(date_column, '(\\d+)/(\\d+)/(\\d+)', '\\3-\\1-\\2') AS DATE)\n"
-    "3. Be aware that DuckDB expects dates in YYYY-MM-DD format\n"
-    "4. For date differences, use DATE_DIFF('day', date1, date2) but ensure proper date formatting first\n\n"
+    "When working with dates in DuckDB:\n"
+    "1. Never use DATE() function directly on columns\n"
+    "2. Do NOT use julianday() function (it doesn't exist in DuckDB)\n"
+    "3. Use TRY_CAST(column_name AS DATE) for date conversions\n"
+    "4. For date differences, use DATE_DIFF('day', date1, date2) function\n"
+    "5. For date comparisons, use the BETWEEN operator or simple comparison operators\n"
+    "6. For date operations, use date_sub(), date_add() functions\n\n"
     "For the output, follow this structure:\n"
     "1. Guess the objective of the user based on their query.\n"
     "2. Describe the steps to achieve this objective in SQL.\n"
@@ -91,15 +93,9 @@ datasets = {}
 
 
 # Helper function to call LLM API
-async def call_llm_system_prompt(user_input, model="gpt-4o-mini", api_base=None):
-    # Make sure we use a system prompt that includes date handling information
+async def call_llm_system_prompt(user_input, model="gpt-4.1-nano", api_base=None):
+    # Use the system prompt directly, no need to check for date handling
     current_prompt = SYSTEM_PROMPT
-    if "When working with dates" not in current_prompt:
-        current_prompt += "\n\nWhen working with dates:\n" \
-                        "1. Always use TRY_CAST() instead of CAST() for date conversions\n" \
-                        "2. If dates are in MM/DD/YYYY format, convert them using: TRY_CAST(regexp_replace(date_column, '(\\d+)/(\\d+)/(\\d+)', '\\3-\\1-\\2') AS DATE)\n" \
-                        "3. Be aware that DuckDB expects dates in YYYY-MM-DD format\n" \
-                        "4. For date differences, use DATE_DIFF('day', date1, date2) but ensure proper date formatting first"
     
     headers = {
         "Authorization": f"Bearer {os.environ['OPENAI_API_KEY']}:querybot",
@@ -134,7 +130,7 @@ class QueryRequest(BaseModel):
     file_path: str
     is_explanation: bool = False
     system_prompt: str | None = None  # Make system_prompt optional
-    model: str = "gpt-4o-mini"  # Default model
+    model: str = "gpt-4.1-nano"  # Default model
     api_base: str | None = None  # Optional custom API base URL
 
 class AnalyzeFileRequest(BaseModel):
@@ -237,7 +233,7 @@ async def upload_csv(request: AnalyzeFileRequest):
             f"Schema: {schema_description}\n"
             "Please provide 5 suggested questions (ONLY QUESTIONS, NO EXPLANATION, NO Serial Numbers) that can be answered using duckDB queries on this dataset."
         )
-        suggested_questions = await call_llm_system_prompt(user_prompt, "gpt-4o-mini")
+        suggested_questions = await call_llm_system_prompt(user_prompt, "gpt-4.1-nano")
 
         uploaded_datasets.append({
                 "dataset_name": dataset_name,
@@ -305,22 +301,10 @@ async def query_data(request: QueryRequest):
 
         # Process each file and create tables in DuckDB
         for file_path in file_paths:
-            df = pd.read_csv(file_path, encoding="utf-8", encoding_errors="replace")
+            df = pd.read_csv(file_path, encoding="utf-8", encoding_errors="replace", dayfirst=True)
             
-            # Try to convert date columns to proper format
-            for col in df.columns:
-                # Check if column might contain dates in M/D/YYYY format
-                if df[col].dtype == 'object':
-                    try:
-                        # Sample a few values to check if they look like dates
-                        samples = df[col].dropna().sample(min(5, len(df[col].dropna()))).tolist()
-                        if any(re.match(r'^\d{1,2}/\d{1,2}/\d{4}$', str(x)) for x in samples):
-                            # Convert to datetime then to YYYY-MM-DD format
-                            df[col] = pd.to_datetime(df[col], errors='coerce').dt.strftime('%Y-%m-%d')
-                    except:
-                        # If conversion fails, continue with the original column
-                        pass
-
+            # No need for the date conversion logic since we're using dayfirst=True
+            
             # Sanitize dataset name to be SQL compatible
             dataset_name = os.path.splitext(os.path.basename(file_path))[0]
             # Replace spaces, dashes, and other non-alphanumeric chars with underscores
@@ -405,21 +389,15 @@ async def query_data(request: QueryRequest):
 
         sql_query = sql_query_match.group(1).strip()
         
-        # Try to fix common date format issues in the query
-        # Only replace CAST if it hasn't been replaced already
-        if "TRY_CAST" not in sql_query:
-            sql_query = sql_query.replace(
-                "CAST(", "TRY_CAST("
-            )
-        else:
-            # Fix any double TRY_CAST instances
-            sql_query = sql_query.replace("TRY_TRY_CAST", "TRY_CAST")
+        # Fix common date syntax issues in DuckDB
+        # Replace DATE() function with TRY_CAST as DATE
+        date_func_pattern = r'DATE\s*\(\s*([^)]+)\s*\)'
+        sql_query = re.sub(date_func_pattern, r'TRY_CAST(\1 AS DATE)', sql_query)
         
-        # Handle ::DATE conversions
-        sql_query = sql_query.replace(
-            "::DATE", "::VARCHAR)::DATE"
-        )
-
+        # Replace julianday() function with proper DuckDB date diff
+        julianday_pattern = r'julianday\s*\(\s*([^)]+)\s*\)\s*-\s*julianday\s*\(\s*([^)]+)\s*\)'
+        sql_query = re.sub(julianday_pattern, r"DATE_DIFF('day', TRY_CAST(\2 AS DATE), TRY_CAST(\1 AS DATE))", sql_query)
+        
         # Log the extracted SQL query (for debugging)
         print(f"Extracted SQL Query: {sql_query}")
 
@@ -427,43 +405,12 @@ async def query_data(request: QueryRequest):
         try:
             result = con.execute(sql_query).fetchdf()
         except Exception as query_error:
-            # If there's an error related to date conversion, try to modify the query
-            error_str = str(query_error)
-            if "date field format" in error_str:
-                # Extract column names from error if possible
-                col_match = re.search(r'CAST\((.*?) AS DATE\)', error_str)
-                if col_match:
-                    problem_col = col_match.group(1)
-                    # Try to execute a simplified query with string-based date comparison instead
-                    modified_query = sql_query.replace(
-                        f"CAST({problem_col} AS DATE)", 
-                        f"TRY_CAST(regexp_replace({problem_col}, '(\\d+)/(\\d+)/(\\d+)', '\\3-\\1-\\2') AS DATE)"
-                    )
-                    
-                    # Fix any double TRY_CAST instances
-                    modified_query = modified_query.replace("TRY_TRY_CAST", "TRY_CAST")
-                    
-                    try:
-                        result = con.execute(modified_query).fetchdf()
-                    except Exception as modified_error:
-                        return JSONResponse(content={
-                            "error": f"Error executing query after date format correction: {str(modified_error)}",
-                            "generated_query": sql_query,
-                            "modified_query": modified_query,
-                            "llm_response": llm_response
-                        }, status_code=400)
-                else:
-                    return JSONResponse(content={
-                        "error": f"Error executing query: {str(query_error)}",
-                        "generated_query": sql_query,
-                        "llm_response": llm_response
-                    }, status_code=400)
-            else:
-                return JSONResponse(content={
-                    "error": f"Error executing query: {str(query_error)}",
-                    "generated_query": sql_query,
-                    "llm_response": llm_response
-                }, status_code=400)
+            # No need for special date handling anymore
+            return JSONResponse(content={
+                "error": f"Error executing query: {str(query_error)}",
+                "generated_query": sql_query,
+                "llm_response": llm_response
+            }, status_code=400)
 
         # Convert any non-JSON serializable types to compatible formats
         result = result.apply(
