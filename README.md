@@ -120,3 +120,6 @@ A: The application supports CSV, Parquet, SQLite, Excel, and MySQL formats.
 
 **Q: How do I report an issue?**
 A: Please use the [Issue Tracker](https://github.com/gramener/querybot/issues) to report any issues you encounter.
+
+---
+> **This is Demo. contains no confidential data/IP**
